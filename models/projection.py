@@ -3,6 +3,20 @@ import numpy as np
 import torch.nn.functional as F
 import math
 
+def ndc2screen(focal_ndc, principal_ndc, size):
+    '''
+    transform the focal length and principal point from ndc to screen
+    following the pytorch3D convention: https://pytorch3d.org/docs/cameras
+    focal_ndc: (N, 2), focal length in ndc
+    principal_ndc: (N, 2), principal point in ndc
+    size: 2, image size
+    '''
+    s = min(size) 
+    focal_screen = focal_ndc * s / 2
+    principal_screen = - principal_ndc * s / 2 + size / 2
+    return focal_screen, principal_screen
+
+
 def pixel2world(slot_pixel_coord, cam2world):
     '''
     slot_pixel_coord: (K-1) * 2 on the image plane, x and y coord are in range [-1, 1]

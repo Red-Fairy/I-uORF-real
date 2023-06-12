@@ -33,35 +33,27 @@ class MultiscenesDataset(BaseDataset):
         BaseDataset.__init__(self, opt)
         self.n_scenes = opt.n_scenes
         self.n_img_each_scene = opt.n_img_each_scene
-        image_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*.png')))  # root/00000_sc000_az00_el00.png
-        mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask.png')))
-        fg_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_moving.png')))
-        moved_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_moved.png')))
-        bg_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_bg.png')))
-        bg_in_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_providing_bg.png')))
-        changed_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_changed.png')))
-        bg_in_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_providing_bg.png')))
-        changed_filenames_set, bg_in_filenames_set = set(changed_filenames), set(bg_in_filenames)
-        bg_mask_filenames_set, bg_in_mask_filenames_set = set(bg_mask_filenames), set(bg_in_mask_filenames)
-        image_filenames_set, mask_filenames_set = set(image_filenames), set(mask_filenames)
-        fg_mask_filenames_set, moved_filenames_set = set(fg_mask_filenames), set(moved_filenames)
-        filenames_set = image_filenames_set - mask_filenames_set - fg_mask_filenames_set - moved_filenames_set - changed_filenames_set - bg_in_filenames_set - bg_mask_filenames_set - bg_in_mask_filenames_set
-        filenames = sorted(list(filenames_set))
-        self.scenes = []
-        for i in range(self.n_scenes):
-            scene_filenames = [x for x in filenames if 'sc{:04d}'.format(i) in x]
-            self.scenes.append(scene_filenames)
+        self.root = opt.dataroot
+
+        # list all directories start with a digit, which means a scene
+        self.scene_names = sorted([x for x in os.listdir(opt.dataroot) if x[0].isdigit()])
+        # in each scene directory, folder 'images' contains all images, 'masks' contains all masks, 'params' contains all camera parameters
+        # load them in the __getitem__ function
 
         self.encoder_type = opt.encoder_type
         self.bg_color = opt.bg_color
 
     def _transform(self, img):
+        # first center crop to make sure the image is square, then resize to load_size
+        img = TF.center_crop(img, min(img.size))
         img = TF.resize(img, (self.opt.load_size, self.opt.load_size))
         img = TF.to_tensor(img)
         img = TF.normalize(img, [0.5] * img.shape[0], [0.5] * img.shape[0])  # [0,1] -> [-1,1]
         return img
 
     def _transform_encoder(self, img, normalize=True):
+        # first center crop to make sure the image is square, then resize to encoder_size
+        img = TF.center_crop(img, min(img.size))
         img = TF.resize(img, (self.opt.encoder_size, self.opt.encoder_size))
         img = TF.to_tensor(img)
         if normalize:
@@ -69,6 +61,7 @@ class MultiscenesDataset(BaseDataset):
         return img
 
     def _transform_mask(self, img):
+        img = TF.center_crop(img, min(img.size))
         img = TF.resize(img, (self.opt.load_size, self.opt.load_size), Image.NEAREST)
         img = TF.to_tensor(img)
         img = TF.normalize(img, [0.5] * img.shape[0], [0.5] * img.shape[0])  # [0,1] -> [-1,1]
@@ -81,7 +74,10 @@ class MultiscenesDataset(BaseDataset):
             index - - a random integer for data indexing, here it is scene_idx
         """
         scene_idx = index
-        scene_filenames = self.scenes[scene_idx]
+        scene_name = self.scene_names[scene_idx]
+        # in each scene directory, folder 'images' contains all images, 'masks' contains all masks, 'params' contains all camera parameters
+        # first load images
+        scene_filenames = sorted(glob.glob(os.path.join(self.root, scene_name, 'images', '*.jpg')))
         if self.opt.isTrain and not self.opt.no_shuffle:
             filenames = random.sample(scene_filenames, self.n_img_each_scene)
         else:
@@ -90,27 +86,21 @@ class MultiscenesDataset(BaseDataset):
         for rd, path in enumerate(filenames):
             img = Image.open(path).convert('RGB')
             img_data = self._transform(img)
-            pose_path = path.replace('.png', '_RT.txt')
+            pose_path = path.replace('images', 'params').replace('.jpg', '_RT.txt')
             try:
                 pose = np.loadtxt(pose_path)
             except FileNotFoundError:
                 print('filenotfound error: {}'.format(pose_path))
                 assert False
-            pose = torch.tensor(pose, dtype=torch.float32)
-            azi_path = pose_path.replace('_RT.txt', '_azi_rot.txt')
-            if self.opt.fixed_locality:
-                azi_rot = np.eye(3)  # not used; placeholder
-            else:
-                azi_rot = np.loadtxt(azi_path)
-            azi_rot = torch.tensor(azi_rot, dtype=torch.float32)
-            depth_path = path.replace('.png', '_depth.npy')
-            if os.path.isfile(depth_path):
-                depth = np.load(depth_path)  # HxWx1
-                depth = torch.from_numpy(depth)  # HxWx1
-                depth = depth.permute([2, 0, 1])  # 1xHxW
-                ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot, 'depth': depth}
-            else:
-                ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot}
+            pose = torch.tensor(pose, dtype=torch.float32) # stored in [R|T] format 4*4
+            # load intrinsics in focal_x, focal_y, principal_x, principal_y order
+            intrinsics_path = path.replace('images', 'params').replace('.jpg', '_intrinsics.txt')
+            intrinsics = np.loadtxt(intrinsics_path)
+            intrinsics = torch.tensor(intrinsics, dtype=torch.float32)
+            focal, principal = intrinsics[:2], intrinsics[2:]
+
+            ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'focal': focal, 'principal': principal}
+
             if rd == 0:
                 if self.opt.preextract:
                     feats_path = path.replace('.png', f'{self.opt.pre_feats}.npy')
@@ -119,7 +109,8 @@ class MultiscenesDataset(BaseDataset):
                 else:
                     normalize = True
                     ret['img_data_large'] = self._transform_encoder(img, normalize=normalize)
-            mask_path = path.replace('.png', '_mask.png')
+        
+            mask_path = path.replace('images', 'masks').replace('.jpg', '.png')
             if os.path.isfile(mask_path):
                 mask = Image.open(mask_path).convert('RGB')
                 mask_l = mask.convert('L')
